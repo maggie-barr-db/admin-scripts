@@ -1,151 +1,372 @@
-import requests
+import os
+import sys
 import json
-from pyspark.sql import functions as f
-from pyspark.sql.types import StructField, ArrayType, StructType, StringType
-from pyspark.sql import Row
+import time
+import argparse
+import configparser
+from typing import Dict, Any, List, Optional
+from datetime import datetime, timezone
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 from pyspark.sql import SparkSession
-from datetime import datetime   
-import pytz
+from pyspark.sql.types import StructType, StructField, StringType, LongType
+from pyspark.sql import functions as F
+from args import parse_args
 
-spark = SparkSession.builder.getOrCreate()
-
-# get the runs
-# TODO: Loop on the pages and add each list of run_ids to a larger list
-databricks_url = "https://e2-demo-field-eng.cloud.databricks.com"
-job_list_endpoint = "/api/2.1/jobs/runs/list"
-token = "dapi0915bb5eb06f66ec8f3fcf4a75c20a7a-2"
-
-start = "2025-09-23 08:00:00"
-end = "2025-09-23 10:59:59"
-
-def est_to_epoch_mil(datetime_str):
-  local = pytz.timezone("US/Eastern")
-  naive = datetime.strptime(datetime_str, "%Y-%m-%d %H:%M:%S")
-  local_dt = local.localize(naive, is_dst=None)
-  utc_dt = local_dt.astimezone(pytz.utc)
-  return utc_dt.timestamp()
-
-converted_start = est_to_epoch_mil(start)
-start_time_from = str(int(converted_start * 1000))
-
-converted_end = est_to_epoch_mil(end)
-start_time_to = str(int(converted_end * 1000))
-
-print("start_time_from: " + start_time_from)
-print("start_time_to: " + start_time_to)
+MAX_API_LIMIT = 26
 
 
-#####################################################################
-#####################################################################
-# GET ALL RUN IDS WHERE THE RUN FAILED
-#####################################################################
-#####################################################################
+def load_databricks_config(
+  explicit_host: Optional[str],
+  explicit_token: Optional[str],
+  profile: Optional[str]
+) -> Dict[str, str]:
+  """Resolve Databricks host and token from args, env, or ~/.databrickscfg.
 
-###################### STEP 1 ######################
-# INITIAL RUN TO GET THE FIRST NEXT_PAGE_TOKEN
+  Precedence (highest to lowest):
+  1) Explicit args (--host/--token). In notebooks, values read from widgets or
+     secrets and supplied to --host/--token are treated as explicit.
+  2) Env vars: DATABRICKS_HOST, DATABRICKS_TOKEN (or DATABRICKS_PERSONAL_ACCESS_TOKEN)
+  3) ~/.databrickscfg (profile via DATABRICKS_CONFIG_PROFILE or --profile)
+  4) If still missing, raise a clear error.
+  """
+  host = explicit_host or os.environ.get("DATABRICKS_HOST") or os.environ.get("DATABRICKS_URL")
+  token = explicit_token or os.environ.get("DATABRICKS_TOKEN") or os.environ.get("DATABRICKS_PERSONAL_ACCESS_TOKEN")
 
-header = {'Authorization':'Bearer {}'.format(token), 'start_time_from':'{}'.format(start_time_from), 'start_time_to':'{}'.format(start_time_to)}
-# payload = """{"page_token": "CAEQ-vidjJ8yIIPS-aqb_Hw="}"""
-payload = """"""
+  if host and token:
+    return {"host": host.rstrip("/"), "token": token}
 
-resp = requests.get(
-  databricks_url + job_list_endpoint,
-  data=payload,
-  headers=header
-)
+  cfg_path = os.path.expanduser("~/.databrickscfg")
+  chosen_profile = profile or os.environ.get("DATABRICKS_CONFIG_PROFILE") or "DEFAULT"
+  if os.path.exists(cfg_path):
+    parser = configparser.ConfigParser()
+    parser.read(cfg_path)
+    if chosen_profile in parser:
+      if not host:
+        host = parser[chosen_profile].get("host")
+      if not token:
+        token = parser[chosen_profile].get("token")
 
-full_run_list = []
+  if not host or not token:
+    raise RuntimeError(
+      "Missing Databricks credentials. Provide --host/--token, set env DATABRICKS_HOST/DATABRICKS_TOKEN, or configure ~/.databrickscfg."
+    )
 
-di = json.loads(resp.text)
-next_page_token = di['next_page_token']
-print(next_page_token)
+  return {"host": host.rstrip("/"), "token": token}
 
-for run in di['runs']:
-  if run['state']['result_state'] == 'FAILED':
 
-    output_runs = run['run_id']# [item.get('run_id') for item in di.get('runs', [])]
-    full_run_list.append(output_runs)
-
-###################### STEP 2 ######################
-# PAGINATE TO GET THE REST OF THE RUNS
-
-while di['has_more'] is True:
-  
-  header = {'Authorization':'Bearer {}'.format(token), 'start_time_from':'{}'.format(start_time_from), 'start_time_to':'{}'.format(start_time_to)}
-  # payload = """{"page_token": "CAEQ-vidjJ8yIIPS-aqb_Hw="}"""
-  payload = """{"page_token": "%s"}"""%(next_page_token)
-
-  resp = requests.get(
-    databricks_url + job_list_endpoint,
-    data=payload,
-    headers=header
+def build_session(total_retries: int = 5, backoff_factor: float = 0.5) -> requests.Session:
+  session = requests.Session()
+  retries = Retry(
+    total=total_retries,
+    backoff_factor=backoff_factor,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "POST"],
+    raise_on_status=False,
   )
+  adapter = HTTPAdapter(max_retries=retries)
+  session.mount("http://", adapter)
+  session.mount("https://", adapter)
+  return session
 
-  di = json.loads(resp.text)
-  next_page_token = di['next_page_token']
 
-  for run in di['runs']:
-    if run['state']['result_state'] == 'FAILED':
+def to_epoch_ms(ts_str: str, assume_utc: bool = True) -> int:
+  """Convert a timestamp string to epoch ms.
 
-      output_runs = run['run_id']# [item.get('run_id') for item in di.get('runs', [])]
-      full_run_list.append(output_runs)
-
-#get the output of a job run
-
-# databricks_url = "https://adb-4731905620902766.6.azuredatabricks.net"
-job_list_endpoint = "/api/2.1/jobs/runs/get-output"
-
-# token = "dapi0915bb5eb06f66ec8f3fcf4a75c20a7a-2"
-
-# Initiate empty full_run_output_df
-# columns = ["run_id", "run_name", "run_page_url", "state", "start_time", "end_time", "term_code", "error"]
-my_schema = StructType([
-    StructField("run_id", StringType()),
-    StructField("run_name", StringType()),
-    StructField("run_page_url", StringType()),
-    StructField("state", StringType()),
-    StructField("start_time", StringType()),
-    StructField("end_time", StringType()),
-    StructField("term_code", StringType()),
-    StructField("error", StringType())
-])
-full_run_output_df = spark.createDataFrame([], schema=my_schema)
-
-count = 0
-for run_id in full_run_list:
-  header = {'Authorization':'Bearer {}'.format(token)}
-  payload = """{"run_id": "%s"}"""%(run_id)
-  # job_list_endpoint = "api/2.0/jobs/runs/get-output?run_id=%s"%(run_id)
-
-  resp = requests.get(
-    databricks_url + job_list_endpoint,
-    data=payload,
-    headers=header
-  )
-
-  run_output = json.loads(resp.text)
-  count = count+1
-  print("trying count num: " + str(count) + " run_id number: " + str(run_id))
-
+  Accepted formats:
+  - ISO 8601 (e.g., 2025-09-24T12:34:56Z or 2025-09-24T12:34:56+00:00)
+  - "YYYY-MM-DD HH:MM:SS" (assumed UTC if assume_utc=True)
+  - "YYYY-MM-DD" (interpreted as start of day 00:00:00)
+  """
+  s = ts_str.strip()
   try:
-    run_name = run_output['metadata']['run_name']
-    run_page_url = run_output['metadata']['run_page_url']
-    state = run_output['metadata']['status']['state']
-    start_time = run_output['metadata']['start_time']
-    end_time = run_output['metadata']['end_time']
-    term_code = run_output['metadata']['status']['termination_details']['code']
-    error = run_output['error']
+    if "T" in s or s.endswith("Z") or "+" in s:
+      # Normalize trailing Z for fromisoformat
+      if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+      dt = datetime.fromisoformat(s)
+    else:
+      # Fallbacks for date or datetime without timezone
+      if len(s) == 10:  # YYYY-MM-DD
+        s = s + " 00:00:00"
+      dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+      if assume_utc:
+        dt = dt.replace(tzinfo=timezone.utc)
+    if dt.tzinfo is None:
+      dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+  except Exception as e:
+    raise ValueError(f"Could not parse time '{ts_str}': {e}")
 
-    data = [(run_id, run_name, run_page_url, state, start_time, end_time, term_code, error)]                                                                     
 
-    run_output_row_df = spark.createDataFrame(data=data, schema=my_schema)
-    full_run_output_df = full_run_output_df.union(run_output_row_df)
-  except:
-    data = [(run_id, "", "", "", "", "", "", "Could not fetch output for this run")]                                                                     
+def list_failed_runs(
+  host: str,
+  token: str,
+  start_time_from_ms: int,
+  start_time_to_ms: int,
+  limit: int = MAX_API_LIMIT
+) -> List[Dict[str, Any]]:
+  """List failed job runs between start and end (inclusive) using Jobs API 2.2.
 
-    run_output_row_df = spark.createDataFrame(data=data, schema=my_schema)
-    full_run_output_df = full_run_output_df.union(run_output_row_df)
+  Paginates using has_more + next_page_token.
+  Returns the full run objects for runs with result_state == FAILED.
+  """
+  session = build_session()
+  headers = {"Authorization": f"Bearer {token}"}
+  url = f"{host}/api/2.2/jobs/runs/list"
+
+  failed_runs: List[Dict[str, Any]] = []
+  page_token: Optional[str] = None
+
+  # Enforce API maximum page size
+  if not isinstance(limit, int) or limit <= 0:
+    limit = MAX_API_LIMIT
+  if limit > MAX_API_LIMIT:
+    limit = MAX_API_LIMIT
+
+  while True:
+    params: Dict[str, Any] = {
+      "start_time_from": start_time_from_ms,
+      "start_time_to": start_time_to_ms,
+      "limit": limit,
+    }
+    if page_token:
+      params["page_token"] = page_token
+
+    resp = session.get(url, headers=headers, params=params, timeout=60)
+    if resp.status_code >= 400:
+      raise RuntimeError(f"runs/list failed: HTTP {resp.status_code} - {resp.text}")
+    payload = resp.json()
+
+    for run in payload.get("runs", []):
+      state = run.get("state", {})
+      if state.get("result_state") == "FAILED":
+        failed_runs.append(run)
+
+    has_more = payload.get("has_more", False)
+    if has_more:
+      page_token = payload.get("next_page_token")
+      if not page_token:
+        # Defensive: avoid infinite loops if has_more without token
+        break
+      # Gentle throttle to be polite
+      time.sleep(0.1)
+      continue
+    break
+
+  return failed_runs
 
 
-# full_run_output_df.display()
-# full_run_output_df.write.mode('overwrite').saveAsTable("gps_dev.uc_analysis.job_output_analysis")
+def get_run_output(host: str, token: str, run_id: int) -> Dict[str, Any]:
+  session = build_session()
+  headers = {"Authorization": f"Bearer {token}"}
+  url = f"{host}/api/2.2/jobs/runs/get-output"
+  params = {"run_id": run_id}
+  resp = session.get(url, headers=headers, params=params, timeout=60)
+  if resp.status_code >= 400:
+    raise RuntimeError(f"runs/get-output failed for run_id={run_id}: HTTP {resp.status_code} - {resp.text}")
+  return resp.json()
+
+
+def infer_task_type(metadata: Dict[str, Any]) -> Optional[StringType]:
+  # Try common task descriptors
+  task_obj = metadata.get("task") or {}
+  if isinstance(task_obj, dict) and task_obj:
+    # Return key name of the concrete task type if present
+    for k in [
+      "notebook_task",
+      "spark_jar_task",
+      "spark_python_task",
+      "pipeline_task",
+      "python_wheel_task",
+      "spark_submit_task",
+      "dbt_task",
+      "sql_task",
+      "run_job_task",
+    ]:
+      if k in task_obj:
+        return k
+  return None
+
+
+def build_schema() -> StructType:
+  return StructType([
+    StructField("job_id", LongType(), True),
+    StructField("run_id", LongType(), True),
+    StructField("job_name", StringType(), True),
+    StructField("run_name", StringType(), True),
+    StructField("run_page_url", StringType(), True),
+    StructField("task_type", StringType(), True),
+    StructField("start_time_ms", LongType(), True),
+    StructField("end_time_ms", LongType(), True),
+    StructField("duration_ms", LongType(), True),
+    StructField("life_cycle_state", StringType(), True),
+    StructField("result_state", StringType(), True),
+    StructField("state_message", StringType(), True),
+    StructField("termination_code", StringType(), True),
+    StructField("termination_type", StringType(), True),
+    StructField("termination_reason", StringType(), True),
+    StructField("output_error", StringType(), True),
+  ])
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+  from args import parse_args
+  args = parse_args(argv)
+
+  cfg = load_databricks_config(args.host, args.token, args.profile)
+  host = cfg["host"]
+  token = cfg["token"]
+
+  start_ms = to_epoch_ms(args.start)
+  end_ms = to_epoch_ms(args.end)
+  if end_ms < start_ms:
+    raise ValueError("--end must be after --start")
+
+  spark = SparkSession.builder.appName("JobFailureScraper").getOrCreate()
+
+  failed_runs = list_failed_runs(host, token, start_ms, end_ms, limit=args.limit)
+
+  rows: List[tuple] = []
+  schema = build_schema()
+
+  for run in failed_runs:
+    run_id = run.get("run_id")
+    try:
+      out = get_run_output(host, token, run_id)
+    except Exception as e:
+      # Capture minimal info if output call fails
+      state = (run.get("state") or {})
+      life_cycle_state = state.get("life_cycle_state")
+      result_state = state.get("result_state")
+      state_message = state.get("state_message")
+      start_time_ms = run.get("start_time")
+      end_time_ms = run.get("end_time")
+      duration_ms = (end_time_ms - start_time_ms) if (end_time_ms and start_time_ms) else None
+      rows.append((
+        run.get("job_id"),
+        run_id,
+        None,
+        run.get("run_name"),
+        run.get("run_page_url"),
+        None,
+        start_time_ms,
+        end_time_ms,
+        duration_ms,
+        life_cycle_state,
+        result_state,
+        state_message,
+        None,
+        None,
+        None,
+        f"get-output error: {e}",
+      ))
+      continue
+
+    metadata = out.get("metadata", {})
+    state = metadata.get("state") or metadata.get("status") or {}
+    term = state.get("termination_details") or {}
+
+    job_id = metadata.get("job_id") or run.get("job_id")
+    job_name = metadata.get("job_name")
+    run_name = metadata.get("run_name") or run.get("run_name")
+    run_page_url = metadata.get("run_page_url") or run.get("run_page_url")
+    start_time_ms = metadata.get("start_time") or run.get("start_time")
+    end_time_ms = metadata.get("end_time") or run.get("end_time")
+    duration_ms = (end_time_ms - start_time_ms) if (end_time_ms and start_time_ms) else None
+    life_cycle_state = state.get("life_cycle_state") or state.get("state")
+    result_state = state.get("result_state")
+    state_message = state.get("state_message")
+    termination_code = term.get("code")
+    termination_type = term.get("type")
+    termination_reason = term.get("reason")
+    output_error = out.get("error")
+    task_type = infer_task_type(metadata)
+
+    # Fallback job_name to run_name if absent
+    if not job_name:
+      job_name = run_name
+
+    rows.append((
+      job_id,
+      run_id,
+      job_name,
+      run_name,
+      run_page_url,
+      task_type,
+      start_time_ms,
+      end_time_ms,
+      duration_ms,
+      life_cycle_state,
+      result_state,
+      state_message,
+      termination_code,
+      termination_type,
+      termination_reason,
+      output_error,
+    ))
+
+  df = spark.createDataFrame(rows, schema=schema)
+  # Enrich with metadata columns for logging
+  try:
+    job_id_conf = spark.conf.get("spark.databricks.job.id")
+  except Exception:
+    job_id_conf = None
+  try:
+    job_run_id_conf = spark.conf.get("spark.databricks.job.runId")
+  except Exception:
+    job_run_id_conf = None
+  try:
+    task_run_id_conf = spark.conf.get("spark.databricks.job.taskRunId")
+  except Exception:
+    task_run_id_conf = None
+  try:
+    task_key_conf = spark.conf.get("spark.databricks.job.taskKey")
+  except Exception:
+    task_key_conf = None
+  try:
+    cluster_id_conf = spark.conf.get("spark.databricks.clusterUsageTags.clusterId")
+  except Exception:
+    cluster_id_conf = None
+
+  ingest_ms = int(time.time() * 1000)
+  ingest_iso = datetime.fromtimestamp(ingest_ms / 1000, tz=timezone.utc).isoformat()
+  start_iso = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).isoformat()
+  end_iso = datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).isoformat()
+
+  df = (
+    df
+      .withColumn("scrape_start_ms", F.lit(int(start_ms)))
+      .withColumn("scrape_end_ms", F.lit(int(end_ms)))
+      .withColumn("scrape_start_iso", F.lit(start_iso))
+      .withColumn("scrape_end_iso", F.lit(end_iso))
+      .withColumn("ingest_ms", F.lit(ingest_ms))
+      .withColumn("ingest_iso", F.lit(ingest_iso))
+      .withColumn("workspace_host", F.lit(host))
+      .withColumn("job_id", F.lit(job_id_conf))
+      .withColumn("job_run_id", F.lit(job_run_id_conf))
+      .withColumn("task_run_id", F.lit(task_run_id_conf))
+      .withColumn("task_key", F.lit(task_key_conf))
+      .withColumn("cluster_id", F.lit(cluster_id_conf))
+  )
+  if not args.no_show:
+    df.show(truncate=False)
+
+  # Append to logging table if provided
+  if args.log_table:
+    df.write.mode("append").saveAsTable(args.log_table)
+
+  return 0
+
+
+if __name__ == "__main__":
+  try:
+    sys.exit(main())
+  except Exception as exc:
+    print(f"Error: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+
