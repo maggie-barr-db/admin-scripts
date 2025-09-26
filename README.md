@@ -32,6 +32,7 @@ API Details
 - Lists runs via /api/2.2/jobs/runs/list with pagination using next_page_token
 - Server-enforced page size limit is 26; the scraper defaults to 26 and clamps higher values
 - Gets run details via /api/2.2/jobs/runs/get-output
+- For multi-task runs, fetches task metadata and attempts per-task outputs; adds one summary row and per-task rows when available
 
 Run in a Databricks Workspace (Recommended)
 
@@ -76,28 +77,40 @@ CLI Arguments
 - --no-show: Suppress DataFrame display
 - --log-table: Optional; fully qualified table name to append results (creates table on first write if missing)
 
-DataFrame Columns (core)
+Table Schema (auto-created if missing)
 
-- job_id, run_id, job_name, run_name, run_page_url, task_type
-- start_time_ms, end_time_ms, duration_ms
-- life_cycle_state, result_state, state_message
-- termination_code, termination_type, termination_reason
-- output_error
-
-Additional Metadata Columns (logging)
-
-- scrape_start_ms, scrape_end_ms, scrape_start_iso, scrape_end_iso
-- ingest_ms, ingest_iso
-- workspace_host, job_id (job context), job_run_id, task_run_id, task_key, cluster_id
+- job_id (BIGINT) – Job ID from the failed run
+- run_id (BIGINT)
+- job_name (STRING)
+- run_name (STRING)
+- run_page_url (STRING)
+- child_task_run_id (BIGINT)
+- child_task_key (STRING)
+- task_type (STRING)
+- job_start_datetime_iso (STRING, ISO 8601 UTC)
+- job_end_datetime_iso (STRING, ISO 8601 UTC)
+- duration_ms (BIGINT)
+- life_cycle_state, result_state, state_message (STRING)
+- termination_code, termination_type, termination_reason (STRING)
+- output_error (STRING)
+- is_retry (BOOLEAN), attempt_number (BIGINT), original_attempt_run_id (BIGINT)
+- error_category (STRING), error_provider (STRING), error_message_short (STRING)
+- row_added_at (STRING, ISO 8601 UTC)
 
 Troubleshooting
 
 - Invalid limit error: The API caps page size at 26. The script enforces this; pass --limit 26 or smaller
 - Token errors in the runbook: The runbook validates tokens via a lightweight API call and reports clear errors
-- Import caching in notebooks: If code was updated but behavior looks stale, restart the kernel/cluster or reload the module
+- Import caching in notebooks: If code was updated but behavior looks stale, restart the kernel/cluster or reload the module with `importlib.reload`
 
 Notes
 
 - The scraper only collects runs with result_state == FAILED
 - Time inputs are assumed to be UTC if timezone is not provided
+- In ACL mode, automatic schema evolution is blocked; this project auto-creates the table with explicit schema and casts ID columns before writing. If schema changes, DROP TABLE and re-run to re-create.
+
+Performance & Ops
+
+- Consider partitioning by DATE(job_end_datetime_iso) and ZORDER (job_id, run_id, child_task_run_id)
+- Optional dedup: define event_run_id = COALESCE(child_task_run_id, run_id) and ingest via MERGE to collapse retries
 # admin-scripts

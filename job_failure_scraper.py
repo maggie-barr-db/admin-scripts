@@ -12,7 +12,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from pyspark.sql import SparkSession
-from pyspark.sql.types import StructType, StructField, StringType, LongType
+from pyspark.sql.types import StructType, StructField, StringType, LongType, BooleanType
 from pyspark.sql import functions as F
 from args import parse_args
 
@@ -225,6 +225,12 @@ def build_schema() -> StructType:
     StructField("termination_type", StringType(), True),
     StructField("termination_reason", StringType(), True),
     StructField("output_error", StringType(), True),
+    StructField("is_retry", BooleanType(), True),
+    StructField("attempt_number", LongType(), True),
+    StructField("original_attempt_run_id", LongType(), True),
+    StructField("error_category", StringType(), True),
+    StructField("error_provider", StringType(), True),
+    StructField("error_message_short", StringType(), True),
   ])
 
 
@@ -234,6 +240,91 @@ def _sql_literal(value: Any) -> str:
   # Escape backslashes first, then single quotes for SQL literal
   s = s.replace("\\", "\\\\").replace("'", "''")
   return s
+
+
+def _as_int(value: Any) -> Optional[int]:
+  try:
+    return int(value) if value is not None else None
+  except Exception:
+    return None
+
+
+def determine_is_retry(run: Dict[str, Any], metadata: Optional[Dict[str, Any]] = None, details: Optional[Dict[str, Any]] = None) -> bool:
+  """Best-effort detection of retries from Jobs API payloads.
+  Checks attempt_number/run_attempt and original_attempt_run_id if present.
+  """
+  attempt_candidates = [
+    (metadata or {}).get("attempt_number"),
+    (details or {}).get("attempt_number"),
+    run.get("attempt_number"),
+    run.get("run_attempt"),
+  ]
+  for cand in attempt_candidates:
+    n = _as_int(cand)
+    if n is not None and n > 1:
+      return True
+    if n is not None and n > 0:
+      # Some payloads are 0-based
+      return True
+  original_attempt = (details or {}).get("original_attempt_run_id") or run.get("original_attempt_run_id")
+  run_id = run.get("run_id")
+  if original_attempt and run_id and original_attempt != run_id:
+    return True
+  return False
+
+
+def determine_attempt_number(run: Dict[str, Any], metadata: Optional[Dict[str, Any]] = None, details: Optional[Dict[str, Any]] = None) -> Optional[int]:
+  for cand in [
+    (metadata or {}).get("attempt_number"),
+    (details or {}).get("attempt_number"),
+    run.get("attempt_number"),
+    run.get("run_attempt"),
+  ]:
+    n = _as_int(cand)
+    if n is not None:
+      return n
+  return None
+
+
+def determine_original_attempt_run_id(run: Dict[str, Any], details: Optional[Dict[str, Any]] = None) -> Optional[int]:
+  for cand in [
+    (details or {}).get("original_attempt_run_id"),
+    run.get("original_attempt_run_id"),
+  ]:
+    n = _as_int(cand)
+    if n is not None:
+      return n
+  return None
+
+
+def parse_error_fields(message: Optional[str]) -> Dict[str, Optional[str]]:
+  if not message:
+    return {"category": None, "provider": None, "short": None}
+  m = message.replace("\n", " ").strip()
+  upper = m.upper()
+  category = None
+  for key in [
+    "RESOURCE_DOES_NOT_EXIST",
+    "UNAUTHENTICATED",
+    "PERMISSION_DENIED",
+    "INVALID_PARAMETER_VALUE",
+    "INTERNAL_ERROR",
+    "TIMEOUT",
+    "CANCELLED",
+    "NOT_FOUND",
+  ]:
+    if key in upper:
+      category = key
+      break
+  provider = None
+  if "GIT" in upper or "GITHUB" in upper:
+    provider = "GIT"
+  elif "PIPELINE" in upper or "DELTA LIVE TABLES" in upper or "DLT" in upper:
+    provider = "DLT"
+  elif "SCHEMA" in upper or "CATALOG" in upper or "TABLE" in upper:
+    provider = "UNITY_CATALOG"
+  short = m[:240]
+  return {"category": category, "provider": provider, "short": short}
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -271,6 +362,7 @@ def main(argv: Optional[List[str]] = None) -> int:
           if args.debug_multitask:
             print(f"[debug] run_id={run_id} tasks field: {json.dumps(tasks)[:2000]}")
           aggregated_errors: List[str] = []
+          details_job_name = details.get("job_name") or run.get("run_name")
           for t in tasks:
             task_key = t.get("task_key")
             task_run_id = t.get("run_id") or t.get("task_run_id")
@@ -305,26 +397,36 @@ def main(argv: Optional[List[str]] = None) -> int:
           duration_ms = (end_time_ms - start_time_ms) if (end_time_ms and start_time_ms) else None
           start_time_iso = datetime.fromtimestamp(start_time_ms / 1000, tz=timezone.utc).isoformat() if start_time_ms else None
           end_time_iso = datetime.fromtimestamp(end_time_ms / 1000, tz=timezone.utc).isoformat() if end_time_ms else None
-          # Add one row summarizing the run-level failure
+          # Add one row summarizing the run-level failure (no child task ids)
+          is_retry = determine_is_retry(run, None, details)
+          attempt_num = determine_attempt_number(run, None, details)
+          original_attempt = determine_original_attempt_run_id(run, details)
+          err_fields = parse_error_fields("; ".join(aggregated_errors) if aggregated_errors else err_msg)
           rows.append((
-            details_job_id,
-            run_id,
-            None,
-            run.get("run_name"),
-            run.get("run_page_url"),
-            None,
-            start_time_iso,
-            end_time_iso,
-            duration_ms,
-            life_cycle_state,
-            result_state,
-            state_message,
-            None,
-            None,
-            None,
+            details_job_id,                 # job_id
+            run_id,                         # run_id
+            details_job_name,               # job_name
+            run.get("run_name"),           # run_name
+            run.get("run_page_url"),       # run_page_url
+            None,                           # child_task_run_id
+            None,                           # child_task_key
+            "multi_task_run",              # task_type
+            start_time_iso,                 # job_start_datetime_iso
+            end_time_iso,                   # job_end_datetime_iso
+            duration_ms,                    # duration_ms
+            life_cycle_state,               # life_cycle_state
+            result_state,                   # result_state
+            state_message,                  # state_message
+            None,                           # termination_code
+            None,                           # termination_type
+            None,                           # termination_reason
             "; ".join(aggregated_errors) if aggregated_errors else err_msg,
-            None,
-            None,
+            is_retry,                       # is_retry
+            attempt_num,                    # attempt_number
+            original_attempt,               # original_attempt_run_id
+            err_fields["category"],        # error_category
+            err_fields["provider"],        # error_provider
+            err_fields["short"],           # error_message_short
           ))
           # Also add one row per task to enable aggregation by task-level failures
           for t in tasks:
@@ -332,24 +434,30 @@ def main(argv: Optional[List[str]] = None) -> int:
             task_run_id = t.get("run_id") or t.get("task_run_id")
             # Per-task row (child identifiers filled when present; no aggregated error)
             rows.append((
-              details_job_id,
-              run_id,
-              None,
-              run.get("run_name"),
-              run.get("run_page_url"),
-              None,
-              start_time_iso,
-              end_time_iso,
-              duration_ms,
-              life_cycle_state,
-              result_state,
-              state_message,
-              None,
-              None,
-              None,
-              None,
-              task_run_id,
-              task_key,
+              details_job_id,               # job_id
+              run_id,                       # run_id
+              details_job_name,             # job_name
+              run.get("run_name"),         # run_name
+              run.get("run_page_url"),     # run_page_url
+              task_run_id,                  # child_task_run_id
+              task_key,                     # child_task_key
+              (infer_task_type(t) or None), # task_type
+              start_time_iso,               # job_start_datetime_iso
+              end_time_iso,                 # job_end_datetime_iso
+              duration_ms,                  # duration_ms
+              life_cycle_state,             # life_cycle_state
+              result_state,                 # result_state
+              state_message,                # state_message
+              None,                         # termination_code
+              None,                         # termination_type
+              None,                         # termination_reason
+              None,                         # output_error
+              is_retry,                     # is_retry
+              attempt_num,                  # attempt_number
+              original_attempt,             # original_attempt_run_id
+              None,                         # error_category
+              None,                         # error_provider
+              None,                         # error_message_short
             ))
           continue
         except Exception as e_tasks:
@@ -363,23 +471,35 @@ def main(argv: Optional[List[str]] = None) -> int:
           duration_ms = (end_time_ms - start_time_ms) if (end_time_ms and start_time_ms) else None
           start_time_iso = datetime.fromtimestamp(start_time_ms / 1000, tz=timezone.utc).isoformat() if start_time_ms else None
           end_time_iso = datetime.fromtimestamp(end_time_ms / 1000, tz=timezone.utc).isoformat() if end_time_ms else None
+          is_retry_fallback = determine_is_retry(run, None, details)
+          attempt_fallback = determine_attempt_number(run, None, details)
+          original_fallback = determine_original_attempt_run_id(run, details)
+          err_fields_fb = parse_error_fields(f"get-output multi-task fallback failed: {e_tasks}")
           rows.append((
-            run.get("job_id") or -1,
-            run_id,
-            None,
-            run.get("run_name"),
-            run.get("run_page_url"),
-            None,
-            start_time_iso,
-            end_time_iso,
-            duration_ms,
-            life_cycle_state,
-            result_state,
-            state_message,
-            None,
-            None,
-            None,
+            (run.get("job_id") or -1),     # job_id
+            run_id,                         # run_id
+            (run.get("run_name")),         # job_name fallback to run_name
+            run.get("run_name"),           # run_name
+            run.get("run_page_url"),       # run_page_url
+            None,                           # child_task_run_id
+            None,                           # child_task_key
+            None,                           # task_type
+            start_time_iso,                 # job_start_datetime_iso
+            end_time_iso,                   # job_end_datetime_iso
+            duration_ms,                    # duration_ms
+            life_cycle_state,               # life_cycle_state
+            result_state,                   # result_state
+            state_message,                  # state_message
+            None,                           # termination_code
+            None,                           # termination_type
+            None,                           # termination_reason
             f"get-output multi-task fallback failed: {e_tasks}",
+            is_retry_fallback,              # is_retry
+            attempt_fallback,               # attempt_number
+            original_fallback,              # original_attempt_run_id
+            err_fields_fb["category"],      # error_category
+            err_fields_fb["provider"],      # error_provider
+            err_fields_fb["short"],         # error_message_short
           ))
           continue
       # Generic error fallback
@@ -392,23 +512,43 @@ def main(argv: Optional[List[str]] = None) -> int:
       duration_ms = (end_time_ms - start_time_ms) if (end_time_ms and start_time_ms) else None
       start_time_iso = datetime.fromtimestamp(start_time_ms / 1000, tz=timezone.utc).isoformat() if start_time_ms else None
       end_time_iso = datetime.fromtimestamp(end_time_ms / 1000, tz=timezone.utc).isoformat() if end_time_ms else None
+      # Try to fetch details for better job_name/task_type on generic error
+      details_ge = None
+      try:
+        details_ge = get_run_details(host, token, run_id)
+      except Exception:
+        details_ge = None
+      job_name_ge = (details_ge.get("job_name") if details_ge else None) or run.get("run_name")
+      task_type_ge = infer_task_type(details_ge or {})
+      is_retry_generic = determine_is_retry(run)
+      attempt_generic = determine_attempt_number(run)
+      original_generic = determine_original_attempt_run_id(run)
+      err_fields_ge = parse_error_fields(f"get-output error: {e}")
       rows.append((
-        run.get("job_id") or -1,
-        run_id,
-        None,
-        run.get("run_name"),
-        run.get("run_page_url"),
-        None,
-        start_time_iso,
-        end_time_iso,
-        duration_ms,
-        life_cycle_state,
-        result_state,
-        state_message,
-        None,
-        None,
-        None,
+        (run.get("job_id") or -1),       # job_id
+        run_id,                           # run_id
+        job_name_ge,                      # job_name
+        run.get("run_name"),             # run_name
+        run.get("run_page_url"),         # run_page_url
+        None,                             # child_task_run_id
+        None,                             # child_task_key
+        task_type_ge,                     # task_type
+        start_time_iso,                   # job_start_datetime_iso
+        end_time_iso,                     # job_end_datetime_iso
+        duration_ms,                      # duration_ms
+        life_cycle_state,                 # life_cycle_state
+        result_state,                     # result_state
+        state_message,                    # state_message
+        None,                             # termination_code
+        None,                             # termination_type
+        None,                             # termination_reason
         f"get-output error: {e}",
+        is_retry_generic,                 # is_retry
+        attempt_generic,                  # attempt_number
+        original_generic,                 # original_attempt_run_id
+        err_fields_ge["category"],       # error_category
+        err_fields_ge["provider"],       # error_provider
+        err_fields_ge["short"],          # error_message_short
       ))
       continue
 
@@ -438,25 +578,35 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not job_name:
       job_name = run_name
 
+    is_retry_ok = determine_is_retry(run, metadata, None)
+    attempt_ok = determine_attempt_number(run, metadata, None)
+    original_ok = determine_original_attempt_run_id(run, None)
+    err_fields_ok = parse_error_fields(output_error or state_message)
     rows.append((
-      job_id,
-      run_id,
-      job_name,
-      run_name,
-      run_page_url,
-      task_type,
-      start_time_iso,
-      end_time_iso,
-      duration_ms,
-      life_cycle_state,
-      result_state,
-      state_message,
-      termination_code,
-      termination_type,
-      termination_reason,
-      output_error,
-      None,
-      None,
+      job_id,               # job_id
+      run_id,               # run_id
+      job_name,             # job_name
+      run_name,             # run_name
+      run_page_url,         # run_page_url
+      None,                 # child_task_run_id
+      None,                 # child_task_key
+      task_type,            # task_type
+      start_time_iso,       # job_start_datetime_iso
+      end_time_iso,         # job_end_datetime_iso
+      duration_ms,          # duration_ms
+      life_cycle_state,     # life_cycle_state
+      result_state,         # result_state
+      state_message,        # state_message
+      termination_code,     # termination_code
+      termination_type,     # termination_type
+      termination_reason,   # termination_reason
+      output_error,         # output_error
+      is_retry_ok,          # is_retry
+      attempt_ok,           # attempt_number
+      original_ok,          # original_attempt_run_id
+      err_fields_ok["category"],
+      err_fields_ok["provider"],
+      err_fields_ok["short"],
     ))
 
   df = spark.createDataFrame(rows, schema=schema)
@@ -515,30 +665,51 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Create table with explicit schema if it does not exist to enforce column types
     table_ident = args.log_table
     try:
+      required_columns_sql = [
+        ("job_id", "BIGINT"),
+        ("run_id", "BIGINT"),
+        ("job_name", "STRING"),
+        ("run_name", "STRING"),
+        ("run_page_url", "STRING"),
+        ("child_task_run_id", "BIGINT"),
+        ("child_task_key", "STRING"),
+        ("task_type", "STRING"),
+        ("job_start_datetime_iso", "STRING"),
+        ("job_end_datetime_iso", "STRING"),
+        ("duration_ms", "BIGINT"),
+        ("life_cycle_state", "STRING"),
+        ("result_state", "STRING"),
+        ("state_message", "STRING"),
+        ("termination_code", "STRING"),
+        ("termination_type", "STRING"),
+        ("termination_reason", "STRING"),
+        ("output_error", "STRING"),
+        ("is_retry", "BOOLEAN"),
+        ("attempt_number", "BIGINT"),
+        ("original_attempt_run_id", "BIGINT"),
+        ("error_category", "STRING"),
+        ("error_provider", "STRING"),
+        ("error_message_short", "STRING"),
+        ("row_added_at", "STRING"),
+      ]
+
       if not spark.catalog.tableExists(table_ident):
+        cols_ddl = ",\n            ".join([f"{c} {t}" for c, t in required_columns_sql])
         spark.sql(f"""
           CREATE TABLE {table_ident} (
-            job_id BIGINT,
-            run_id BIGINT,
-            job_name STRING,
-            run_name STRING,
-            run_page_url STRING,
-            child_task_run_id BIGINT,
-            child_task_key STRING,
-            task_type STRING,
-            job_start_datetime_iso STRING,
-            job_end_datetime_iso STRING,
-            duration_ms BIGINT,
-            life_cycle_state STRING,
-            result_state STRING,
-            state_message STRING,
-            termination_code STRING,
-            termination_type STRING,
-            termination_reason STRING,
-            output_error STRING,
-            row_added_at STRING
+            {cols_ddl}
           ) USING DELTA
         """)
+      else:
+        # Add any missing columns explicitly (ACL mode blocks auto-merge)
+        try:
+          existing_cols = set([f.name for f in spark.table(table_ident).schema.fields])
+          missing = [(c, t) for c, t in required_columns_sql if c not in existing_cols]
+          if missing:
+            add_ddl = ", ".join([f"{c} {t}" for c, t in missing])
+            spark.sql(f"ALTER TABLE {table_ident} ADD COLUMNS ({add_ddl})")
+        except Exception as e_alter:
+          print(f"Warning: could not alter {table_ident} to add missing columns: {e_alter}")
     except Exception as e:
       print(f"Warning: could not ensure table schema for {table_ident}: {e}")
 
