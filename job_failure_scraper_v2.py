@@ -14,6 +14,8 @@ from urllib3.util.retry import Retry
 from pyspark.sql import SparkSession
 from pyspark.sql.types import StructType, StructField, StringType, LongType
 
+MAX_API_LIMIT = 26
+
 
 def load_databricks_config(
   explicit_host: Optional[str],
@@ -101,7 +103,7 @@ def list_failed_runs(
   token: str,
   start_time_from_ms: int,
   start_time_to_ms: int,
-  limit: int = 100
+  limit: int = MAX_API_LIMIT
 ) -> List[Dict[str, Any]]:
   """List failed job runs between start and end (inclusive) using Jobs API 2.2.
 
@@ -114,6 +116,12 @@ def list_failed_runs(
 
   failed_runs: List[Dict[str, Any]] = []
   page_token: Optional[str] = None
+
+  # Enforce API maximum page size
+  if not isinstance(limit, int) or limit <= 0:
+    limit = MAX_API_LIMIT
+  if limit > MAX_API_LIMIT:
+    limit = MAX_API_LIMIT
 
   while True:
     params: Dict[str, Any] = {
@@ -208,7 +216,7 @@ def main(argv: Optional[List[str]] = None) -> int:
   parser.add_argument("--host", default=None, help="Databricks workspace URL, e.g. https://xyz.cloud.databricks.com")
   parser.add_argument("--token", default=None, help="Databricks personal access token")
   parser.add_argument("--profile", default=None, help="Profile name from ~/.databrickscfg (fallback if no host/token provided)")
-  parser.add_argument("--limit", type=int, default=100, help="Page size for runs/list (default 100)")
+  parser.add_argument("--limit", type=int, default=MAX_API_LIMIT, help="Page size for runs/list (max 26; default 26)")
   parser.add_argument("--no-show", action="store_true", help="Do not show the resulting DataFrame")
 
   args = parser.parse_args(argv)
