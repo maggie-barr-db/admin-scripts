@@ -475,6 +475,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     df
       .withColumn("row_added_at", F.lit(ingest_iso))
   )
+
+  # Ensure strong types in the DataFrame before writing
+  df = df.withColumn("job_id", F.col("job_id").cast(LongType()))
+  df = df.withColumn("run_id", F.col("run_id").cast(LongType()))
+  df = df.withColumn("child_task_run_id", F.col("child_task_run_id").cast(LongType()))
   if not args.no_show:
     df.show(truncate=False)
 
