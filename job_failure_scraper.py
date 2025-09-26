@@ -507,10 +507,39 @@ def main(argv: Optional[List[str]] = None) -> int:
 
   # Append to logging table if provided
   if args.log_table:
-    df.write.mode("append").saveAsTable(args.log_table)
+    # Create table with explicit schema if it does not exist to enforce column types
+    table_ident = args.log_table
+    try:
+      if not spark.catalog.tableExists(table_ident):
+        spark.sql(f"""
+          CREATE TABLE {table_ident} (
+            job_id BIGINT,
+            run_id BIGINT,
+            job_name STRING,
+            run_name STRING,
+            run_page_url STRING,
+            child_task_run_id BIGINT,
+            child_task_key STRING,
+            task_type STRING,
+            job_start_datetime_iso STRING,
+            job_end_datetime_iso STRING,
+            duration_ms BIGINT,
+            life_cycle_state STRING,
+            result_state STRING,
+            state_message STRING,
+            termination_code STRING,
+            termination_type STRING,
+            termination_reason STRING,
+            output_error STRING,
+            row_added_at STRING
+          ) USING DELTA
+        """)
+    except Exception as e:
+      print(f"Warning: could not ensure table schema for {table_ident}: {e}")
+
+    df.write.mode("append").saveAsTable(table_ident)
     # Apply Unity Catalog metadata if specified
     spark = SparkSession.builder.getOrCreate()
-    table_ident = args.log_table
     # Table comment
     if args.table_comment:
       spark.sql(f"COMMENT ON TABLE {table_ident} IS '{_sql_literal(args.table_comment)}'")
