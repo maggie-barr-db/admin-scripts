@@ -15,6 +15,12 @@ def build_parser() -> argparse.ArgumentParser:
   parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT, help="Page size for runs/list (max 26; default 26)")
   parser.add_argument("--no-show", action="store_true", help="Do not show the resulting DataFrame")
   parser.add_argument("--log-table", default=None, help="Fully qualified table to append results to, e.g. catalog.schema.table")
+  # Unity Catalog metadata (optional)
+  parser.add_argument("--table-comment", default=None, help="Unity Catalog table comment for data discovery")
+  parser.add_argument("--table-tags", default=None, help="JSON object of UC table tags: {\"tag\": \"value\", ...}")
+  parser.add_argument("--column-comments", default=None, help="JSON object of column->comment mappings")
+  parser.add_argument("--column-tags", default=None, help="JSON object of column->{tag->value} mappings")
+  parser.add_argument("--column-masks", default=None, help="JSON object of column->masking_policy_name mappings")
   return parser
 
 

@@ -160,14 +160,27 @@ def list_failed_runs(
   return failed_runs
 
 
-def get_run_output(host: str, token: str, run_id: int) -> Dict[str, Any]:
+def get_run_output(host: str, token: str, run_id: int, task_key: Optional[str] = None) -> Dict[str, Any]:
   session = build_session()
   headers = {"Authorization": f"Bearer {token}"}
   url = f"{host}/api/2.2/jobs/runs/get-output"
-  params = {"run_id": run_id}
+  params: Dict[str, Any] = {"run_id": run_id}
+  if task_key:
+    params["task_key"] = task_key
   resp = session.get(url, headers=headers, params=params, timeout=60)
   if resp.status_code >= 400:
     raise RuntimeError(f"runs/get-output failed for run_id={run_id}: HTTP {resp.status_code} - {resp.text}")
+  return resp.json()
+
+
+def get_run_details(host: str, token: str, run_id: int) -> Dict[str, Any]:
+  session = build_session()
+  headers = {"Authorization": f"Bearer {token}"}
+  url = f"{host}/api/2.2/jobs/runs/get"
+  params = {"run_id": run_id}
+  resp = session.get(url, headers=headers, params=params, timeout=60)
+  if resp.status_code >= 400:
+    raise RuntimeError(f"runs/get failed for run_id={run_id}: HTTP {resp.status_code} - {resp.text}")
   return resp.json()
 
 
@@ -238,7 +251,79 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
       out = get_run_output(host, token, run_id)
     except Exception as e:
-      # Capture minimal info if output call fails
+      err_msg = str(e)
+      # If multi-task run output isn't supported at run-level, fetch per-task outputs
+      if "multiple tasks is not supported" in err_msg:
+        try:
+          details = get_run_details(host, token, run_id)
+          tasks = details.get("tasks", []) or []
+          aggregated_errors: List[str] = []
+          for t in tasks:
+            task_key = t.get("task_key")
+            try:
+              task_out = get_run_output(host, token, run_id, task_key=task_key) if task_key else None
+              task_err = None
+              if task_out is not None:
+                task_err = task_out.get("error")
+              aggregated_errors.append(f"{task_key or 'unknown_task'}: {task_err or 'no error field'}")
+            except Exception as te:
+              aggregated_errors.append(f"{task_key or 'unknown_task'}: get-output error: {te}")
+          # Fall through to add a row with aggregated errors
+          state = (run.get("state") or {})
+          life_cycle_state = state.get("life_cycle_state")
+          result_state = state.get("result_state")
+          state_message = state.get("state_message")
+          start_time_ms = run.get("start_time")
+          end_time_ms = run.get("end_time")
+          duration_ms = (end_time_ms - start_time_ms) if (end_time_ms and start_time_ms) else None
+          rows.append((
+            run.get("job_id"),
+            run_id,
+            None,
+            run.get("run_name"),
+            run.get("run_page_url"),
+            None,
+            start_time_ms,
+            end_time_ms,
+            duration_ms,
+            life_cycle_state,
+            result_state,
+            state_message,
+            None,
+            None,
+            None,
+            "; ".join(aggregated_errors) if aggregated_errors else err_msg,
+          ))
+          continue
+        except Exception as e_tasks:
+          # Could not enumerate tasks; record original error
+          state = (run.get("state") or {})
+          life_cycle_state = state.get("life_cycle_state")
+          result_state = state.get("result_state")
+          state_message = state.get("state_message")
+          start_time_ms = run.get("start_time")
+          end_time_ms = run.get("end_time")
+          duration_ms = (end_time_ms - start_time_ms) if (end_time_ms and start_time_ms) else None
+          rows.append((
+            run.get("job_id"),
+            run_id,
+            None,
+            run.get("run_name"),
+            run.get("run_page_url"),
+            None,
+            start_time_ms,
+            end_time_ms,
+            duration_ms,
+            life_cycle_state,
+            result_state,
+            state_message,
+            None,
+            None,
+            None,
+            f"get-output multi-task fallback failed: {e_tasks}",
+          ))
+          continue
+      # Generic error fallback
       state = (run.get("state") or {})
       life_cycle_state = state.get("life_cycle_state")
       result_state = state.get("result_state")
@@ -358,6 +443,52 @@ def main(argv: Optional[List[str]] = None) -> int:
   # Append to logging table if provided
   if args.log_table:
     df.write.mode("append").saveAsTable(args.log_table)
+    # Apply Unity Catalog metadata if specified
+    spark = SparkSession.builder.getOrCreate()
+    table_ident = args.log_table
+    # Table comment
+    if args.table_comment:
+      spark.sql(f"COMMENT ON TABLE {table_ident} IS '{args.table_comment.replace('\\', '\\\\').replace("'", "''")}'")
+    # Table tags (table properties)
+    if args.table_tags:
+      try:
+        props = json.loads(args.table_tags)
+        if isinstance(props, dict) and props:
+          assignments = ", ".join([f"{k}='{str(v).replace('\\', '\\\\').replace("'", "''")}'" for k, v in props.items()])
+          spark.sql(f"ALTER TABLE {table_ident} SET TBLPROPERTIES ({assignments})")
+      except Exception as e:
+        print(f"Warning: failed to apply table tags: {e}")
+    # Column comments
+    if args.column_comments:
+      try:
+        col_comments = json.loads(args.column_comments)
+        if isinstance(col_comments, dict):
+          for col, comment in col_comments.items():
+            safe_comment = str(comment).replace('\\', '\\\\').replace("'", "''")
+            spark.sql(f"ALTER TABLE {table_ident} ALTER COLUMN `{col}` COMMENT '{safe_comment}'")
+      except Exception as e:
+        print(f"Warning: failed to apply column comments: {e}")
+    # Column tags (properties on columns)
+    if args.column_tags:
+      try:
+        col_tags = json.loads(args.column_tags)
+        if isinstance(col_tags, dict):
+          for col, tags in col_tags.items():
+            if isinstance(tags, dict) and tags:
+              assignments = ", ".join([f"{k}='{str(v).replace('\\', '\\\\').replace("'", "''")}'" for k, v in tags.items()])
+              spark.sql(f"ALTER TABLE {table_ident} ALTER COLUMN `{col}` SET TAGS ({assignments})")
+      except Exception as e:
+        print(f"Warning: failed to apply column tags: {e}")
+    # Column masking policies
+    if args.column_masks:
+      try:
+        col_masks = json.loads(args.column_masks)
+        if isinstance(col_masks, dict):
+          for col, policy in col_masks.items():
+            if policy:
+              spark.sql(f"ALTER TABLE {table_ident} ALTER COLUMN `{col}` SET MASKING POLICY {policy}")
+      except Exception as e:
+        print(f"Warning: failed to apply column masking policies: {e}")
 
   return 0
 
