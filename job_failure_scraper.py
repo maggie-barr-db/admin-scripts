@@ -226,6 +226,14 @@ def build_schema() -> StructType:
   ])
 
 
+def _sql_literal(value: Any) -> str:
+  """Return a SQL-safe single-quoted literal content (without surrounding quotes)."""
+  s = str(value)
+  # Escape backslashes first, then single quotes for SQL literal
+  s = s.replace("\\", "\\\\").replace("'", "''")
+  return s
+
+
 def main(argv: Optional[List[str]] = None) -> int:
   from args import parse_args
   args = parse_args(argv)
@@ -448,13 +456,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     table_ident = args.log_table
     # Table comment
     if args.table_comment:
-      spark.sql(f"COMMENT ON TABLE {table_ident} IS '{args.table_comment.replace('\\', '\\\\').replace("'", "''")}'")
+      spark.sql(f"COMMENT ON TABLE {table_ident} IS '{_sql_literal(args.table_comment)}'")
     # Table tags (table properties)
     if args.table_tags:
       try:
         props = json.loads(args.table_tags)
         if isinstance(props, dict) and props:
-          assignments = ", ".join([f"{k}='{str(v).replace('\\', '\\\\').replace("'", "''")}'" for k, v in props.items()])
+          assignments = ", ".join([f"{k}='{_sql_literal(v)}'" for k, v in props.items()])
           spark.sql(f"ALTER TABLE {table_ident} SET TBLPROPERTIES ({assignments})")
       except Exception as e:
         print(f"Warning: failed to apply table tags: {e}")
@@ -464,8 +472,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         col_comments = json.loads(args.column_comments)
         if isinstance(col_comments, dict):
           for col, comment in col_comments.items():
-            safe_comment = str(comment).replace('\\', '\\\\').replace("'", "''")
-            spark.sql(f"ALTER TABLE {table_ident} ALTER COLUMN `{col}` COMMENT '{safe_comment}'")
+            spark.sql(f"ALTER TABLE {table_ident} ALTER COLUMN `{col}` COMMENT '{_sql_literal(comment)}'")
       except Exception as e:
         print(f"Warning: failed to apply column comments: {e}")
     # Column tags (properties on columns)
@@ -475,7 +482,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if isinstance(col_tags, dict):
           for col, tags in col_tags.items():
             if isinstance(tags, dict) and tags:
-              assignments = ", ".join([f"{k}='{str(v).replace('\\', '\\\\').replace("'", "''")}'" for k, v in tags.items()])
+              assignments = ", ".join([f"{k}='{_sql_literal(v)}'" for k, v in tags.items()])
               spark.sql(f"ALTER TABLE {table_ident} ALTER COLUMN `{col}` SET TAGS ({assignments})")
       except Exception as e:
         print(f"Warning: failed to apply column tags: {e}")
