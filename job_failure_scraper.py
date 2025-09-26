@@ -215,8 +215,8 @@ def build_schema() -> StructType:
     StructField("child_task_run_id", LongType(), True),
     StructField("child_task_key", StringType(), True),
     StructField("task_type", StringType(), True),
-    StructField("start_time_ms", LongType(), True),
-    StructField("end_time_ms", LongType(), True),
+    StructField("job_start_datetime_iso", StringType(), True),
+    StructField("job_end_datetime_iso", StringType(), True),
     StructField("duration_ms", LongType(), True),
     StructField("life_cycle_state", StringType(), True),
     StructField("result_state", StringType(), True),
@@ -302,6 +302,8 @@ def main(argv: Optional[List[str]] = None) -> int:
           start_time_ms = run.get("start_time")
           end_time_ms = run.get("end_time")
           duration_ms = (end_time_ms - start_time_ms) if (end_time_ms and start_time_ms) else None
+          start_time_iso = datetime.fromtimestamp(start_time_ms / 1000, tz=timezone.utc).isoformat() if start_time_ms else None
+          end_time_iso = datetime.fromtimestamp(end_time_ms / 1000, tz=timezone.utc).isoformat() if end_time_ms else None
           # Add one row summarizing the run-level failure
           rows.append((
             run.get("job_id"),
@@ -310,8 +312,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             run.get("run_name"),
             run.get("run_page_url"),
             None,
-            start_time_ms,
-            end_time_ms,
+            start_time_iso,
+            end_time_iso,
             duration_ms,
             life_cycle_state,
             result_state,
@@ -327,6 +329,7 @@ def main(argv: Optional[List[str]] = None) -> int:
           for t in tasks:
             task_key = t.get("task_key")
             task_run_id = t.get("run_id") or t.get("task_run_id")
+            # Per-task row (child identifiers filled when present; no aggregated error)
             rows.append((
               run.get("job_id"),
               run_id,
@@ -334,8 +337,8 @@ def main(argv: Optional[List[str]] = None) -> int:
               run.get("run_name"),
               run.get("run_page_url"),
               None,
-              start_time_ms,
-              end_time_ms,
+              start_time_iso,
+              end_time_iso,
               duration_ms,
               life_cycle_state,
               result_state,
@@ -357,6 +360,8 @@ def main(argv: Optional[List[str]] = None) -> int:
           start_time_ms = run.get("start_time")
           end_time_ms = run.get("end_time")
           duration_ms = (end_time_ms - start_time_ms) if (end_time_ms and start_time_ms) else None
+          start_time_iso = datetime.fromtimestamp(start_time_ms / 1000, tz=timezone.utc).isoformat() if start_time_ms else None
+          end_time_iso = datetime.fromtimestamp(end_time_ms / 1000, tz=timezone.utc).isoformat() if end_time_ms else None
           rows.append((
             run.get("job_id"),
             run_id,
@@ -364,8 +369,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             run.get("run_name"),
             run.get("run_page_url"),
             None,
-            start_time_ms,
-            end_time_ms,
+            start_time_iso,
+            end_time_iso,
             duration_ms,
             life_cycle_state,
             result_state,
@@ -384,6 +389,8 @@ def main(argv: Optional[List[str]] = None) -> int:
       start_time_ms = run.get("start_time")
       end_time_ms = run.get("end_time")
       duration_ms = (end_time_ms - start_time_ms) if (end_time_ms and start_time_ms) else None
+      start_time_iso = datetime.fromtimestamp(start_time_ms / 1000, tz=timezone.utc).isoformat() if start_time_ms else None
+      end_time_iso = datetime.fromtimestamp(end_time_ms / 1000, tz=timezone.utc).isoformat() if end_time_ms else None
       rows.append((
         run.get("job_id"),
         run_id,
@@ -391,8 +398,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         run.get("run_name"),
         run.get("run_page_url"),
         None,
-        start_time_ms,
-        end_time_ms,
+        start_time_iso,
+        end_time_iso,
         duration_ms,
         life_cycle_state,
         result_state,
@@ -415,6 +422,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     start_time_ms = metadata.get("start_time") or run.get("start_time")
     end_time_ms = metadata.get("end_time") or run.get("end_time")
     duration_ms = (end_time_ms - start_time_ms) if (end_time_ms and start_time_ms) else None
+    start_time_iso = datetime.fromtimestamp(start_time_ms / 1000, tz=timezone.utc).isoformat() if start_time_ms else None
+    end_time_iso = datetime.fromtimestamp(end_time_ms / 1000, tz=timezone.utc).isoformat() if end_time_ms else None
     life_cycle_state = state.get("life_cycle_state") or state.get("state")
     result_state = state.get("result_state")
     state_message = state.get("state_message")
@@ -435,8 +444,8 @@ def main(argv: Optional[List[str]] = None) -> int:
       run_name,
       run_page_url,
       task_type,
-      start_time_ms,
-      end_time_ms,
+      start_time_iso,
+      end_time_iso,
       duration_ms,
       life_cycle_state,
       result_state,
@@ -452,22 +461,6 @@ def main(argv: Optional[List[str]] = None) -> int:
   df = spark.createDataFrame(rows, schema=schema)
   # Enrich with metadata columns for logging
   try:
-    job_id_conf = spark.conf.get("spark.databricks.job.id")
-  except Exception:
-    job_id_conf = None
-  try:
-    job_run_id_conf = spark.conf.get("spark.databricks.job.runId")
-  except Exception:
-    job_run_id_conf = None
-  try:
-    task_run_id_conf = spark.conf.get("spark.databricks.job.taskRunId")
-  except Exception:
-    task_run_id_conf = None
-  try:
-    task_key_conf = spark.conf.get("spark.databricks.job.taskKey")
-  except Exception:
-    task_key_conf = None
-  try:
     cluster_id_conf = spark.conf.get("spark.databricks.clusterUsageTags.clusterId")
   except Exception:
     cluster_id_conf = None
@@ -479,18 +472,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
   df = (
     df
-      .withColumn("scrape_start_ms", F.lit(int(start_ms)))
-      .withColumn("scrape_end_ms", F.lit(int(end_ms)))
-      .withColumn("scrape_start_iso", F.lit(start_iso))
-      .withColumn("scrape_end_iso", F.lit(end_iso))
-      .withColumn("ingest_ms", F.lit(ingest_ms))
-      .withColumn("ingest_iso", F.lit(ingest_iso))
-      .withColumn("workspace_host", F.lit(host))
-      .withColumn("job_id", F.lit(job_id_conf))
-      .withColumn("job_run_id", F.lit(job_run_id_conf))
-      .withColumn("task_run_id", F.lit(task_run_id_conf))
-      .withColumn("task_key", F.lit(task_key_conf))
-      .withColumn("cluster_id", F.lit(cluster_id_conf))
+      .withColumn("row_added_at", F.lit(ingest_iso))
   )
   if not args.no_show:
     df.show(truncate=False)
