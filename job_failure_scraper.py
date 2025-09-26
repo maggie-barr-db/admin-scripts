@@ -267,6 +267,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         try:
           details = get_run_details(host, token, run_id)
           tasks = details.get("tasks", []) or []
+          details_job_id = details.get("job_id") or run.get("job_id") or -1
           if args.debug_multitask:
             print(f"[debug] run_id={run_id} tasks field: {json.dumps(tasks)[:2000]}")
           aggregated_errors: List[str] = []
@@ -306,7 +307,7 @@ def main(argv: Optional[List[str]] = None) -> int:
           end_time_iso = datetime.fromtimestamp(end_time_ms / 1000, tz=timezone.utc).isoformat() if end_time_ms else None
           # Add one row summarizing the run-level failure
           rows.append((
-            run.get("job_id"),
+            details_job_id,
             run_id,
             None,
             run.get("run_name"),
@@ -331,7 +332,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             task_run_id = t.get("run_id") or t.get("task_run_id")
             # Per-task row (child identifiers filled when present; no aggregated error)
             rows.append((
-              run.get("job_id"),
+              details_job_id,
               run_id,
               None,
               run.get("run_name"),
@@ -363,7 +364,7 @@ def main(argv: Optional[List[str]] = None) -> int:
           start_time_iso = datetime.fromtimestamp(start_time_ms / 1000, tz=timezone.utc).isoformat() if start_time_ms else None
           end_time_iso = datetime.fromtimestamp(end_time_ms / 1000, tz=timezone.utc).isoformat() if end_time_ms else None
           rows.append((
-            run.get("job_id"),
+            run.get("job_id") or -1,
             run_id,
             None,
             run.get("run_name"),
@@ -392,7 +393,7 @@ def main(argv: Optional[List[str]] = None) -> int:
       start_time_iso = datetime.fromtimestamp(start_time_ms / 1000, tz=timezone.utc).isoformat() if start_time_ms else None
       end_time_iso = datetime.fromtimestamp(end_time_ms / 1000, tz=timezone.utc).isoformat() if end_time_ms else None
       rows.append((
-        run.get("job_id"),
+        run.get("job_id") or -1,
         run_id,
         None,
         run.get("run_name"),
@@ -415,7 +416,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     state = metadata.get("state") or metadata.get("status") or {}
     term = state.get("termination_details") or {}
 
-    job_id = metadata.get("job_id") or run.get("job_id")
+    job_id = metadata.get("job_id") or run.get("job_id") or -1
     job_name = metadata.get("job_name")
     run_name = metadata.get("run_name") or run.get("run_name")
     run_page_url = metadata.get("run_page_url") or run.get("run_page_url")
