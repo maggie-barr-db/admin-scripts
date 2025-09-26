@@ -21,6 +21,9 @@ def build_parser() -> argparse.ArgumentParser:
   parser.add_argument("--column-comments", default=None, help="JSON object of column->comment mappings")
   parser.add_argument("--column-tags", default=None, help="JSON object of column->{tag->value} mappings")
   parser.add_argument("--column-masks", default=None, help="JSON object of column->masking_policy_name mappings")
+  # Debug multi-task runs
+  parser.add_argument("--debug-multitask", action="store_true", help="Print and optionally log detailed info for multi-task run handling")
+  parser.add_argument("--debug-table", default=None, help="Optional table to append debug rows for multi-task runs")
   return parser
 
 

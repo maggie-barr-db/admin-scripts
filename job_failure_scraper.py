@@ -267,6 +267,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         try:
           details = get_run_details(host, token, run_id)
           tasks = details.get("tasks", []) or []
+          if args.debug_multitask:
+            print(f"[debug] run_id={run_id} tasks field: {json.dumps(tasks)[:2000]}")
           aggregated_errors: List[str] = []
           for t in tasks:
             task_key = t.get("task_key")
@@ -274,9 +276,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             try:
               # Prefer calling get-output on the task's own run_id when available
               if task_run_id:
+                if args.debug_multitask:
+                  print(f"[debug] trying child run_id={task_run_id} for task_key={task_key}")
                 task_out = get_run_output(host, token, task_run_id)
               elif task_key:
                 # Fallback: some environments may accept parent run + task_key
+                if args.debug_multitask:
+                  print(f"[debug] trying parent run_id={run_id} with task_key={task_key}")
                 task_out = get_run_output(host, token, run_id, task_key=task_key)
               else:
                 task_out = None
@@ -286,6 +292,8 @@ def main(argv: Optional[List[str]] = None) -> int:
               aggregated_errors.append(f"{task_key or task_run_id or 'unknown_task'}: {task_err or 'no error field'}")
             except Exception as te:
               aggregated_errors.append(f"{task_key or task_run_id or 'unknown_task'}: get-output error: {te}")
+          if args.debug_multitask and aggregated_errors:
+            print(f"[debug] aggregated_errors for run_id={run_id}: {'; '.join(aggregated_errors)[:2000]}")
           # Fall through to add a row with aggregated errors
           state = (run.get("state") or {})
           life_cycle_state = state.get("life_cycle_state")
@@ -486,6 +494,33 @@ def main(argv: Optional[List[str]] = None) -> int:
   )
   if not args.no_show:
     df.show(truncate=False)
+
+  # Optional debug table logging for multi-task diagnostics
+  if args.debug_multitask and args.debug_table:
+    try:
+      debug_rows = []
+      for run in failed_runs:
+        debug_rows.append((
+          run.get("job_id"),
+          run.get("run_id"),
+          json.dumps(run.get("state", {}))[:4000],
+          run.get("run_name"),
+          run.get("run_page_url"),
+          host,
+          ingest_iso,
+        ))
+      debug_schema = StructType([
+        StructField("job_id", LongType(), True),
+        StructField("run_id", LongType(), True),
+        StructField("state_json", StringType(), True),
+        StructField("run_name", StringType(), True),
+        StructField("run_page_url", StringType(), True),
+        StructField("workspace_host", StringType(), True),
+        StructField("ingest_iso", StringType(), True),
+      ])
+      spark.createDataFrame(debug_rows, schema=debug_schema).write.mode("append").saveAsTable(args.debug_table)
+    except Exception as e:
+      print(f"Warning: failed to write debug table: {e}")
 
   # Append to logging table if provided
   if args.log_table:
