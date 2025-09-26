@@ -212,6 +212,8 @@ def build_schema() -> StructType:
     StructField("job_name", StringType(), True),
     StructField("run_name", StringType(), True),
     StructField("run_page_url", StringType(), True),
+    StructField("child_task_run_id", LongType(), True),
+    StructField("child_task_key", StringType(), True),
     StructField("task_type", StringType(), True),
     StructField("start_time_ms", LongType(), True),
     StructField("end_time_ms", LongType(), True),
@@ -268,14 +270,22 @@ def main(argv: Optional[List[str]] = None) -> int:
           aggregated_errors: List[str] = []
           for t in tasks:
             task_key = t.get("task_key")
+            task_run_id = t.get("run_id") or t.get("task_run_id")
             try:
-              task_out = get_run_output(host, token, run_id, task_key=task_key) if task_key else None
+              # Prefer calling get-output on the task's own run_id when available
+              if task_run_id:
+                task_out = get_run_output(host, token, task_run_id)
+              elif task_key:
+                # Fallback: some environments may accept parent run + task_key
+                task_out = get_run_output(host, token, run_id, task_key=task_key)
+              else:
+                task_out = None
               task_err = None
               if task_out is not None:
                 task_err = task_out.get("error")
-              aggregated_errors.append(f"{task_key or 'unknown_task'}: {task_err or 'no error field'}")
+              aggregated_errors.append(f"{task_key or task_run_id or 'unknown_task'}: {task_err or 'no error field'}")
             except Exception as te:
-              aggregated_errors.append(f"{task_key or 'unknown_task'}: get-output error: {te}")
+              aggregated_errors.append(f"{task_key or task_run_id or 'unknown_task'}: get-output error: {te}")
           # Fall through to add a row with aggregated errors
           state = (run.get("state") or {})
           life_cycle_state = state.get("life_cycle_state")
@@ -284,6 +294,7 @@ def main(argv: Optional[List[str]] = None) -> int:
           start_time_ms = run.get("start_time")
           end_time_ms = run.get("end_time")
           duration_ms = (end_time_ms - start_time_ms) if (end_time_ms and start_time_ms) else None
+          # Add one row summarizing the run-level failure
           rows.append((
             run.get("job_id"),
             run_id,
@@ -301,7 +312,33 @@ def main(argv: Optional[List[str]] = None) -> int:
             None,
             None,
             "; ".join(aggregated_errors) if aggregated_errors else err_msg,
+            None,
+            None,
           ))
+          # Also add one row per task to enable aggregation by task-level failures
+          for t in tasks:
+            task_key = t.get("task_key")
+            task_run_id = t.get("run_id") or t.get("task_run_id")
+            rows.append((
+              run.get("job_id"),
+              run_id,
+              None,
+              run.get("run_name"),
+              run.get("run_page_url"),
+              None,
+              start_time_ms,
+              end_time_ms,
+              duration_ms,
+              life_cycle_state,
+              result_state,
+              state_message,
+              None,
+              None,
+              None,
+              None,
+              task_run_id,
+              task_key,
+            ))
           continue
         except Exception as e_tasks:
           # Could not enumerate tasks; record original error
@@ -400,6 +437,8 @@ def main(argv: Optional[List[str]] = None) -> int:
       termination_type,
       termination_reason,
       output_error,
+      None,
+      None,
     ))
 
   df = spark.createDataFrame(rows, schema=schema)
