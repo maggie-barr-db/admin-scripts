@@ -2,7 +2,6 @@ import os
 import sys
 import json
 import time
-import argparse
 import configparser
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
@@ -15,6 +14,18 @@ from pyspark.sql import SparkSession
 from pyspark.sql.types import StructType, StructField, StringType, LongType, BooleanType
 from pyspark.sql import functions as F
 from args import parse_args
+from job_failure_scraper.api import list_failed_runs, get_run_output, get_run_details
+from job_failure_scraper.utils import (
+  build_schema,
+  infer_task_type,
+  _sql_literal,
+  _as_int,
+  determine_is_retry,
+  determine_attempt_number,
+  determine_original_attempt_run_id,
+  parse_error_fields,
+  to_epoch_ms,
+)
 
 MAX_API_LIMIT = 26
 
@@ -56,276 +67,6 @@ def load_databricks_config(
     )
 
   return {"host": host.rstrip("/"), "token": token}
-
-
-def build_session(total_retries: int = 5, backoff_factor: float = 0.5) -> requests.Session:
-  session = requests.Session()
-  retries = Retry(
-    total=total_retries,
-    backoff_factor=backoff_factor,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["GET", "POST"],
-    raise_on_status=False,
-  )
-  adapter = HTTPAdapter(max_retries=retries)
-  session.mount("http://", adapter)
-  session.mount("https://", adapter)
-  return session
-
-
-def to_epoch_ms(ts_str: str, assume_utc: bool = True) -> int:
-  """Convert a timestamp string to epoch ms.
-
-  Accepted formats:
-  - ISO 8601 (e.g., 2025-09-24T12:34:56Z or 2025-09-24T12:34:56+00:00)
-  - "YYYY-MM-DD HH:MM:SS" (assumed UTC if assume_utc=True)
-  - "YYYY-MM-DD" (interpreted as start of day 00:00:00)
-  """
-  s = ts_str.strip()
-  try:
-    if "T" in s or s.endswith("Z") or "+" in s:
-      # Normalize trailing Z for fromisoformat
-      if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-      dt = datetime.fromisoformat(s)
-    else:
-      # Fallbacks for date or datetime without timezone
-      if len(s) == 10:  # YYYY-MM-DD
-        s = s + " 00:00:00"
-      dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-      if assume_utc:
-        dt = dt.replace(tzinfo=timezone.utc)
-    if dt.tzinfo is None:
-      dt = dt.replace(tzinfo=timezone.utc)
-    return int(dt.timestamp() * 1000)
-  except Exception as e:
-    raise ValueError(f"Could not parse time '{ts_str}': {e}")
-
-
-def list_failed_runs(
-  host: str,
-  token: str,
-  start_time_from_ms: int,
-  start_time_to_ms: int,
-  limit: int = MAX_API_LIMIT
-) -> List[Dict[str, Any]]:
-  """List failed job runs between start and end (inclusive) using Jobs API 2.2.
-
-  Paginates using has_more + next_page_token.
-  Returns the full run objects for runs with result_state == FAILED.
-  """
-  session = build_session()
-  headers = {"Authorization": f"Bearer {token}"}
-  url = f"{host}/api/2.2/jobs/runs/list"
-
-  failed_runs: List[Dict[str, Any]] = []
-  page_token: Optional[str] = None
-
-  # Enforce API maximum page size
-  if not isinstance(limit, int) or limit <= 0:
-    limit = MAX_API_LIMIT
-  if limit > MAX_API_LIMIT:
-    limit = MAX_API_LIMIT
-
-  while True:
-    params: Dict[str, Any] = {
-      "start_time_from": start_time_from_ms,
-      "start_time_to": start_time_to_ms,
-      "limit": limit,
-    }
-    if page_token:
-      params["page_token"] = page_token
-
-    resp = session.get(url, headers=headers, params=params, timeout=60)
-    if resp.status_code >= 400:
-      raise RuntimeError(f"runs/list failed: HTTP {resp.status_code} - {resp.text}")
-    payload = resp.json()
-
-    for run in payload.get("runs", []):
-      state = run.get("state", {})
-      if state.get("result_state") == "FAILED":
-        failed_runs.append(run)
-
-    has_more = payload.get("has_more", False)
-    if has_more:
-      page_token = payload.get("next_page_token")
-      if not page_token:
-        # Defensive: avoid infinite loops if has_more without token
-        break
-      # Gentle throttle to be polite
-      time.sleep(0.1)
-      continue
-    break
-
-  return failed_runs
-
-
-def get_run_output(host: str, token: str, run_id: int, task_key: Optional[str] = None) -> Dict[str, Any]:
-  session = build_session()
-  headers = {"Authorization": f"Bearer {token}"}
-  url = f"{host}/api/2.2/jobs/runs/get-output"
-  params: Dict[str, Any] = {"run_id": run_id}
-  if task_key:
-    params["task_key"] = task_key
-  resp = session.get(url, headers=headers, params=params, timeout=60)
-  if resp.status_code >= 400:
-    raise RuntimeError(f"runs/get-output failed for run_id={run_id}: HTTP {resp.status_code} - {resp.text}")
-  return resp.json()
-
-
-def get_run_details(host: str, token: str, run_id: int) -> Dict[str, Any]:
-  session = build_session()
-  headers = {"Authorization": f"Bearer {token}"}
-  url = f"{host}/api/2.2/jobs/runs/get"
-  params = {"run_id": run_id}
-  resp = session.get(url, headers=headers, params=params, timeout=60)
-  if resp.status_code >= 400:
-    raise RuntimeError(f"runs/get failed for run_id={run_id}: HTTP {resp.status_code} - {resp.text}")
-  return resp.json()
-
-
-def infer_task_type(metadata: Dict[str, Any]) -> Optional[StringType]:
-  # Try common task descriptors
-  task_obj = metadata.get("task") or {}
-  if isinstance(task_obj, dict) and task_obj:
-    # Return key name of the concrete task type if present
-    for k in [
-      "notebook_task",
-      "spark_jar_task",
-      "spark_python_task",
-      "pipeline_task",
-      "python_wheel_task",
-      "spark_submit_task",
-      "dbt_task",
-      "sql_task",
-      "run_job_task",
-    ]:
-      if k in task_obj:
-        return k
-  return None
-
-
-def build_schema() -> StructType:
-  return StructType([
-    StructField("job_id", LongType(), True),
-    StructField("run_id", LongType(), True),
-    StructField("job_name", StringType(), True),
-    StructField("run_name", StringType(), True),
-    StructField("run_page_url", StringType(), True),
-    StructField("child_task_run_id", LongType(), True),
-    StructField("child_task_key", StringType(), True),
-    StructField("task_type", StringType(), True),
-    StructField("job_start_datetime_iso", StringType(), True),
-    StructField("job_end_datetime_iso", StringType(), True),
-    StructField("duration_ms", LongType(), True),
-    StructField("life_cycle_state", StringType(), True),
-    StructField("result_state", StringType(), True),
-    StructField("state_message", StringType(), True),
-    StructField("termination_code", StringType(), True),
-    StructField("termination_type", StringType(), True),
-    StructField("termination_reason", StringType(), True),
-    StructField("output_error", StringType(), True),
-    StructField("is_retry", BooleanType(), True),
-    StructField("attempt_number", LongType(), True),
-    StructField("original_attempt_run_id", LongType(), True),
-    StructField("error_category", StringType(), True),
-    StructField("error_provider", StringType(), True),
-    StructField("error_message_short", StringType(), True),
-  ])
-
-
-def _sql_literal(value: Any) -> str:
-  """Return a SQL-safe single-quoted literal content (without surrounding quotes)."""
-  s = str(value)
-  # Escape backslashes first, then single quotes for SQL literal
-  s = s.replace("\\", "\\\\").replace("'", "''")
-  return s
-
-
-def _as_int(value: Any) -> Optional[int]:
-  try:
-    return int(value) if value is not None else None
-  except Exception:
-    return None
-
-
-def determine_is_retry(run: Dict[str, Any], metadata: Optional[Dict[str, Any]] = None, details: Optional[Dict[str, Any]] = None) -> bool:
-  """Best-effort detection of retries from Jobs API payloads.
-  Checks attempt_number/run_attempt and original_attempt_run_id if present.
-  """
-  attempt_candidates = [
-    (metadata or {}).get("attempt_number"),
-    (details or {}).get("attempt_number"),
-    run.get("attempt_number"),
-    run.get("run_attempt"),
-  ]
-  for cand in attempt_candidates:
-    n = _as_int(cand)
-    if n is not None and n > 1:
-      return True
-    if n is not None and n > 0:
-      # Some payloads are 0-based
-      return True
-  original_attempt = (details or {}).get("original_attempt_run_id") or run.get("original_attempt_run_id")
-  run_id = run.get("run_id")
-  if original_attempt and run_id and original_attempt != run_id:
-    return True
-  return False
-
-
-def determine_attempt_number(run: Dict[str, Any], metadata: Optional[Dict[str, Any]] = None, details: Optional[Dict[str, Any]] = None) -> Optional[int]:
-  for cand in [
-    (metadata or {}).get("attempt_number"),
-    (details or {}).get("attempt_number"),
-    run.get("attempt_number"),
-    run.get("run_attempt"),
-  ]:
-    n = _as_int(cand)
-    if n is not None:
-      return n
-  return None
-
-
-def determine_original_attempt_run_id(run: Dict[str, Any], details: Optional[Dict[str, Any]] = None) -> Optional[int]:
-  for cand in [
-    (details or {}).get("original_attempt_run_id"),
-    run.get("original_attempt_run_id"),
-  ]:
-    n = _as_int(cand)
-    if n is not None:
-      return n
-  return None
-
-
-def parse_error_fields(message: Optional[str]) -> Dict[str, Optional[str]]:
-  if not message:
-    return {"category": None, "provider": None, "short": None}
-  m = message.replace("\n", " ").strip()
-  upper = m.upper()
-  category = None
-  for key in [
-    "RESOURCE_DOES_NOT_EXIST",
-    "UNAUTHENTICATED",
-    "PERMISSION_DENIED",
-    "INVALID_PARAMETER_VALUE",
-    "INTERNAL_ERROR",
-    "TIMEOUT",
-    "CANCELLED",
-    "NOT_FOUND",
-  ]:
-    if key in upper:
-      category = key
-      break
-  provider = None
-  if "GIT" in upper or "GITHUB" in upper:
-    provider = "GIT"
-  elif "PIPELINE" in upper or "DELTA LIVE TABLES" in upper or "DLT" in upper:
-    provider = "DLT"
-  elif "SCHEMA" in upper or "CATALOG" in upper or "TABLE" in upper:
-    provider = "UNITY_CATALOG"
-  short = m[:240]
-  return {"category": category, "provider": provider, "short": short}
-
 
 def main(argv: Optional[List[str]] = None) -> int:
   from args import parse_args
