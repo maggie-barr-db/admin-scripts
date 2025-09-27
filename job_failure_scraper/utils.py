@@ -54,7 +54,6 @@ def build_schema() -> StructType:
     StructField("error_category", StringType(), True),
     StructField("error_provider", StringType(), True),
     StructField("error_message_short", StringType(), True),
-    StructField("row_added_at", StringType(), True),
   ])
 
 
