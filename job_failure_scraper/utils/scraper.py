@@ -4,7 +4,7 @@ import json
 import time
 import configparser
 from typing import Dict, Any, List, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -13,9 +13,9 @@ from urllib3.util.retry import Retry
 from pyspark.sql import SparkSession
 from pyspark.sql.types import StructType, StructField, StringType, LongType, BooleanType
 from pyspark.sql import functions as F
-from args import parse_args
-from job_failure_scraper.api import list_failed_runs, get_run_output, get_run_details
-from job_failure_scraper.utils import (
+from job_failure_scraper.args import parse_args
+from job_failure_scraper.utils.api import list_failed_runs, get_run_output, get_run_details
+from job_failure_scraper.utils.utils import (
   build_schema,
   infer_task_type,
   _sql_literal,
@@ -28,6 +28,63 @@ from job_failure_scraper.utils import (
 )
 
 MAX_API_LIMIT = 26
+
+
+def _now_iso_utc() -> str:
+  return datetime.now(tz=timezone.utc).isoformat()
+
+
+def _detect_host_from_spark(spark: SparkSession) -> Optional[str]:
+  try:
+    return "https://" + spark.conf.get("spark.databricks.workspaceUrl")
+  except Exception:
+    return None
+
+
+def _table_exists(spark: SparkSession, table_ident: str) -> bool:
+  try:
+    return spark.catalog.tableExists(table_ident)
+  except Exception:
+    return False
+
+
+def _read_last_run_iso(spark: SparkSession, state_table: Optional[str], log_table: Optional[str]) -> Optional[str]:
+  if state_table and _table_exists(spark, state_table):
+    try:
+      df = spark.table(state_table)
+      if "last_run_iso" in df.columns:
+        row = df.agg(F.max("last_run_iso").alias("ts")).first()
+        if row and row["ts"]:
+          return str(row["ts"]).strip()
+    except Exception:
+      pass
+  if log_table and _table_exists(spark, log_table):
+    try:
+      df = spark.table(log_table)
+      if "row_added_at" in df.columns:
+        row = df.agg(F.max("row_added_at").alias("ts")).first()
+        if row and row["ts"]:
+          return str(row["ts"]).strip()
+    except Exception:
+      pass
+  return None
+
+
+def _write_last_run_iso(spark: SparkSession, state_table: str, end_iso: str) -> None:
+  try:
+    spark.sql(f"""
+      CREATE TABLE IF NOT EXISTS {state_table} (
+        id STRING,
+        last_run_iso STRING,
+        updated_at STRING
+      ) USING DELTA
+    """)
+    spark.sql(f"DELETE FROM {state_table} WHERE id = 'main'")
+    spark.sql(
+      f"INSERT INTO {state_table} VALUES ('main', '{_sql_literal(end_iso)}', '{_sql_literal(_now_iso_utc())}')"
+    )
+  except Exception as e:
+    print(f"Warning: failed to persist watermark to {state_table}: {e}")
 
 
 def load_databricks_config(
@@ -72,16 +129,36 @@ def main(argv: Optional[List[str]] = None) -> int:
   from args import parse_args
   args = parse_args(argv)
 
-  cfg = load_databricks_config(args.host, args.token, args.profile)
+  spark = SparkSession.builder.appName("JobFailureScraper").getOrCreate()
+
+  # Detect host if not provided explicitly
+  detected_host = args.host or _detect_host_from_spark(spark)
+
+  cfg = load_databricks_config(detected_host, args.token, args.profile)
   host = cfg["host"]
   token = cfg["token"]
 
-  start_ms = to_epoch_ms(args.start)
-  end_ms = to_epoch_ms(args.end)
+  now_iso = _now_iso_utc()
+  end_iso = args.end or now_iso
+  start_iso = args.start
+  if not start_iso:
+    watermark = _read_last_run_iso(spark, getattr(args, "state_table", None), args.log_table)
+    if watermark:
+      start_iso = watermark
+    else:
+      # Default to last 24h
+      ref = end_iso
+      if ref.endswith("Z"):
+        ref = ref[:-1] + "+00:00"
+      start_dt = datetime.fromisoformat(ref)
+      if start_dt.tzinfo is None:
+        start_dt = start_dt.replace(tzinfo=timezone.utc)
+      start_iso = (start_dt - timedelta(hours=24)).isoformat()
+
+  start_ms = to_epoch_ms(start_iso)
+  end_ms = to_epoch_ms(end_iso)
   if end_ms < start_ms:
     raise ValueError("--end must be after --start")
-
-  spark = SparkSession.builder.appName("JobFailureScraper").getOrCreate()
 
   failed_runs = list_failed_runs(host, token, start_ms, end_ms, limit=args.limit)
 
@@ -359,8 +436,6 @@ def main(argv: Optional[List[str]] = None) -> int:
 
   ingest_ms = int(time.time() * 1000)
   ingest_iso = datetime.fromtimestamp(ingest_ms / 1000, tz=timezone.utc).isoformat()
-  start_iso = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).isoformat()
-  end_iso = datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).isoformat()
 
   df = (
     df

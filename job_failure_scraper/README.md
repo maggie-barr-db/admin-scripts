@@ -4,13 +4,14 @@ Overview
 
 - Collects failed Databricks job runs in a given time window via Jobs API 2.2 and materializes results as a PySpark DataFrame.
 - Can append results to a Delta table for auditing/monitoring.
-- Includes a Databricks runbook notebook with UI widgets to simplify execution in a workspace.
+- Supports direct execution via CLI or as a scheduled Databricks job (DAB).
 
 Repo Contents
 
 - job_failure_scraper.py: Main scraper (Jobs API 2.2, pagination, output enrichment, optional table logging)
 - args.py: Centralized CLI argument parser for the scraper
-- job_failure_scraper_runbook.ipynb: Notebook runbook with widgets and token validation
+- job_failure_scraper/scraper.py: Also supports scheduled jobs with optional --state-table watermarking
+- bundle.yml: Databricks Asset Bundle defining a scheduled job
 
 Requirements
 
@@ -34,17 +35,9 @@ API Details
 - Gets run details via /api/2.2/jobs/runs/get-output
 - For multi-task runs, fetches task metadata and attempts per-task outputs; adds one summary row and per-task rows when available
 
-Run in a Databricks Workspace (Recommended)
+Run in a Databricks Workspace
 
-1) Add this repo to your Databricks workspace (Repos) so the notebook and modules are importable
-2) Open job_failure_scraper_runbook.ipynb
-3) Run the first cell to create widgets; fill in:
-   - start (UTC), end (UTC)
-   - limit (use 26 unless you need smaller pages)
-   - log_table (optional, fully qualified: catalog.schema.table)
-   - token (PAT) OR secret_scope + secret_key
-   - Host is auto-detected from the current workspace
-4) Run the second cell to validate the token, execute the scraper, and optionally append to the log table
+Use the Databricks Asset Bundle job defined in `bundle.yml`, or invoke `job_failure_scraper/scraper.py` with parameters from a Databricks job (spark_python_task). Host is auto-detected; pass `--token` if needed.
 
 Local CLI Usage
 
@@ -76,6 +69,48 @@ CLI Arguments
 - --limit: Page size for the API (max 26; default 26)
 - --no-show: Suppress DataFrame display
 - --log-table: Optional; fully qualified table name to append results (creates table on first write if missing)
+
+Databricks Asset Bundle (Scheduled Job)
+
+Prerequisites
+
+- Databricks CLI configured with a profile targeting your workspace.
+- Unity Catalog catalog/schema for `log_table` and `state_table` exist and are writable.
+
+Bundle Variables (bundle.yml)
+
+- workspace_host: Workspace URL (e.g. https://xyz.cloud.databricks.com)
+- log_table: Fully qualified logging table (catalog.schema.table)
+- state_table: Fully qualified watermark table (catalog.schema.table)
+- spark_version: Runtime (default 14.3.x-scala2.12)
+- node_type_id: Node type (default i3.xlarge)
+- run_as_user/run_as_spn: Identity for dev/prod targets
+
+Deploy and Run
+
+```bash
+# Validate the bundle locally
+databricks bundles validate
+
+# Deploy to target (e.g., dev)
+databricks bundles deploy -t dev
+
+# Run the job on demand (optional)
+databricks bundles run -t dev -r scraper-job
+```
+
+What It Does
+
+- The job runs daily at 19:00 UTC.
+- Entry point `job_failure_scraper/scraper.py` computes the time window from the last watermark:
+  - Uses `--state-table` last_run_iso if available; otherwise falls back to `max(row_added_at)` in `--log-table`; otherwise defaults to 24h window.
+  - Calls the scraper with `--start`, `--end`, `--limit=26`, and passes through `--log-table` and optional UC metadata flags.
+  - Persists the new watermark (`end_iso`) back to `--state-table` after success.
+
+Parameters to Override (optional)
+
+- You can pass `--start` and/or `--end` to `entrypoint.py` via `parameters` in `bundle.yml` to override the computed window.
+- You can pass `--host`/`--token` if you prefer not to rely on cluster/workspace defaults and cluster identity.
 
 Table Schema (auto-created if missing)
 

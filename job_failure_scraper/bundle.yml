@@ -1,0 +1,60 @@
+bundle:
+  name: job-failure-scraper
+
+targets:
+  dev:
+    workspace:
+      host: ${var.workspace_host}
+    run_as:
+      user_name: ${var.run_as_user}
+  prod:
+    workspace:
+      host: ${var.workspace_host}
+    run_as:
+      service_principal_name: ${var.run_as_spn}
+
+resources:
+  jobs:
+    scraper-job:
+      name: Job Failure Scraper (DAB)
+      schedule:
+        quartz_cron_expression: "0 0 19 * * ?"
+        timezone_id: "UTC"
+        pause_status: UNPAUSED
+      tasks:
+        - task_key: run-scraper
+          new_cluster:
+            spark_version: ${var.spark_version}
+            serverless: true
+            num_workers: ${var.num_workers}
+          spark_python_task:
+            python_file: utils/scraper.py
+            parameters:
+              - --log-table
+              - ${var.log_table}
+              - --state-table
+              - ${var.state_table}
+              - --limit
+              - "26"
+
+variables:
+  workspace_host:
+    description: Workspace host (e.g. https://abc.cloud.databricks.com)
+  run_as_user:
+    description: User email to run as (dev)
+    optional: true
+  run_as_spn:
+    description: Service principal app id (prod)
+    optional: true
+  log_table:
+    description: Fully qualified table (catalog.schema.table)
+  state_table:
+    description: Fully qualified table for watermark (catalog.schema.table)
+  spark_version:
+    description: Runtime version compatible with serverless (e.g. 14.3.x-scala2.12)
+    default: 14.3.x-scala2.12
+  num_workers:
+    description: Number of workers for serverless job cluster
+    default: 1
+
+
